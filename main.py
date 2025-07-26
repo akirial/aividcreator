@@ -27,6 +27,7 @@ USAGE_FILE = "clip_usage.json"
 # Initialize in-memory list for recent call timestamps
 recent_calls = []
 
+
 def load_usage():
     today = datetime.date.today().isoformat()
     if os.path.exists(USAGE_FILE):
@@ -36,9 +37,11 @@ def load_usage():
             return data
     return {"date": today, "daily_count": 0}
 
+
 def save_usage(data):
     with open(USAGE_FILE, "w") as f:
         _json.dump(data, f)
+
 
 # Configuration
 api_key = os.environ.get("OPENAI_API_KEY")
@@ -154,11 +157,11 @@ def generate_veo_clip(scene: dict, output_dir: str, send_to_api: bool, progress=
     narration = scene.get('narration') or scene.get('Narration') or ""
     narrator = scene.get('narrator') or scene.get('Narrator') or ""
     visual_prompt = (
-        scene.get('visual_prompt')
-        or scene.get('Visual_prompt')
-        or scene.get('visualPrompt')
-        or scene.get('visualPrompt')
-        or ""
+            scene.get('visual_prompt')
+            or scene.get('Visual_prompt')
+            or scene.get('visualPrompt')
+            or scene.get('visualPrompt')
+            or ""
     )
     # Ensure scene number exists
     if 'scene' not in scene:
@@ -200,34 +203,88 @@ def generate_veo_clip(scene: dict, output_dir: str, send_to_api: bool, progress=
             recent_calls.pop(0)
         if len(recent_calls) >= MINUTE_CLIP_LIMIT:
             wait = 60 - (now - recent_calls[0])
-            print(f"[WARNING] Minute rate limit reached. Waiting {int(wait)+1} seconds...")
+            print(f"[WARNING] Minute rate limit reached. Waiting {int(wait) + 1} seconds...")
             time.sleep(wait + 1)
             continue
         try:
             client = genai.Client(api_key=genai_api_key)
-            operation = client.models.generate_videos(
-                model=model_name,
-                prompt=prompt,
-                config=types.GenerateVideosConfig(
-                    person_generation="allow_adult",
-                    aspect_ratio="16:9",
-                ),
-            )
+
+            # Only add image argument if a previous frame exists and can be loaded as bytes
+            prev_frame_path = scene.get('prev_frame_image')
+            image_arg = None
+            if prev_frame_path and os.path.exists(prev_frame_path):
+                try:
+                    with open(prev_frame_path, "rb") as f:
+                        image_arg = types.Image.from_bytes(f.read(), mime_type="image/png")
+                    print(f"[DEBUG] Loaded prev_frame_image and passing as context: {prev_frame_path}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to load prev_frame_image {prev_frame_path}: {e}")
+
+            # Build kwargs only if image_arg is not None
+            if image_arg is not None:
+                operation = client.models.generate_videos(
+                    model=model_name,
+                    prompt=prompt,
+                    image=image_arg,
+                    config=types.GenerateVideosConfig(
+                        person_generation="allow_adult",
+                        aspect_ratio="16:9",
+                    ),
+                )
+            else:
+                operation = client.models.generate_videos(
+                    model=model_name,
+                    prompt=prompt,
+                    config=types.GenerateVideosConfig(
+                        person_generation="allow_adult",
+                        aspect_ratio="16:9",
+                    ),
+                )
 
             while not operation.done:
                 time.sleep(5)
                 operation = client.operations.get(operation)
 
-            generated = operation.response.generated_videos[0]
-            client.files.download(file=generated.video)
-            video_path = os.path.join(output_dir, f"scene_{scene['scene']}.mp4")
-            generated.video.save(video_path)
-            print(f"[DEBUG] Downloaded to {video_path}")
-            # Track usage
-            recent_calls.append(time.time())
-            usage["daily_count"] += 1
-            save_usage(usage)
-            return video_path
+            if operation.response and getattr(operation.response, "generated_videos", None):
+                generated = operation.response.generated_videos[0]
+                client.files.download(file=generated.video)
+                video_path = os.path.join(output_dir, f"scene_{scene['scene']}.mp4")
+                generated.video.save(video_path)
+                print(f"[DEBUG] Downloaded to {video_path}")
+                # Save last frame of this clip for inspection (cv2 fallback to ffmpeg)
+                last_frame_png = os.path.splitext(video_path)[0] + ".png"
+                try:
+                    import cv2
+                    cap = cv2.VideoCapture(video_path)
+                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count - 1)
+                    ret, frame = cap.read()
+                    cap.release()
+                    if ret and cv2.imwrite(last_frame_png, frame):
+                        print(f"[DEBUG] Saved last frame image via cv2 at: {last_frame_png}")
+                    else:
+                        print(f"[DEBUG] cv2 failed to extract last frame for {video_path}")
+                except ImportError:
+                    # Fallback to ffmpeg if cv2 is unavailable
+                    try:
+                        import subprocess
+                        cmd = ["ffmpeg", "-y", "-sseof", "-0.1", "-i", video_path, "-vframes", "1", last_frame_png]
+                        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        print(f"[DEBUG] Extracted last frame via ffmpeg at: {last_frame_png}")
+                    except Exception as ff_err:
+                        print(f"[DEBUG] Fallback ffmpeg frame extraction failed: {ff_err}")
+                except Exception as e:
+                    print(f"[DEBUG] Exception extracting last frame via cv2: {e}")
+                # Track usage
+                recent_calls.append(time.time())
+                usage["daily_count"] += 1
+                save_usage(usage)
+                return video_path
+            else:
+                print(f"[ERROR] Veo API returned no video for scene {scene['scene']}. Full operation: {operation}")
+                if hasattr(operation, "error"):
+                    print(f"[ERROR] Veo operation error: {operation.error}")
+                return ""
 
         except Exception as e:
             error_str = str(e)
@@ -236,7 +293,7 @@ def generate_veo_clip(scene: dict, output_dir: str, send_to_api: bool, progress=
                                "Please enable billing in your GCP project to use this model.")
                 print(f"[ERROR] {billing_msg}")
                 return ""
-            elif "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
+            elif "RESOURCE_EXHASED" in error_str or "quota" in error_str.lower():
                 print(f"[ERROR] Quota/rate limit error: {e}. Retrying in {RETRY_INTERVAL} seconds...")
                 for remaining in range(RETRY_INTERVAL, 0, -1):
                     print(f"[INFO] Retrying in {remaining} seconds...", end="\r")
@@ -266,6 +323,7 @@ class VideoApp:
         output_dir = os.path.join(base_dir, f"{project_name}_{timestamp}")
         os.makedirs(output_dir, exist_ok=True)
         return output_dir
+
     def send_clips_one_by_one(self, scenes):
         output_dir = self.get_output_directory()
         self.generated_clips = []  # Track scene files
@@ -276,15 +334,20 @@ class VideoApp:
             self.root.update()
             self.generate_video([scene], output_dir=output_dir)
             self.log_debug(f"[SEND] Finished sending scene {scene_label}.")
-
-        # All clips are done, stitch videos once
+        # Stitch after all
         self.stitch_videos(output_dir, scenes)
+
     def __init__(self, root):
         self.root = root
         self.root.title("AI YouTube Video Generator")
 
         self.last_send_time = 0
         self.progress_bars = {}
+
+        # Gemini Quota label at top
+        self.gemini_quota_label = ttk.Label(root, text="Gemini Quota: ...")
+        self.gemini_quota_label.pack(anchor="nw", padx=10, pady=(5, 0))
+        self.refresh_gemini_quota()
 
         self.notebook = ttk.Notebook(root)
         self.script_frame = ttk.Frame(self.notebook)
@@ -295,8 +358,19 @@ class VideoApp:
         self.notebook.add(self.debug_frame, text="Debug Log")
         self.notebook.pack(fill="both", expand=True)
 
-        self.debug_button = ttk.Button(root, text="View Debug Log", command=lambda: self.notebook.select(self.debug_frame))
+        self.debug_button = ttk.Button(root, text="View Debug Log",
+                                       command=lambda: self.notebook.select(self.debug_frame))
         self.debug_button.pack(anchor="ne", padx=10, pady=5)
+
+        # Chain clips option (Veo2 only) -- for video generation UI
+        self.chain_clips_var = tk.BooleanVar(value=True)
+        self.chain_check = ttk.Checkbutton(
+            self.video_frame,
+            text="Chain clips (Veo2 only)",
+            variable=self.chain_clips_var
+        )
+        # Place under the Veo version radios
+        self.chain_check.pack(anchor="w", padx=10, pady=5)
 
         self.idea_label = ttk.Label(self.script_frame, text="Video Idea:")
         self.idea_label.pack()
@@ -319,7 +393,8 @@ class VideoApp:
         self.minutes_output.pack()
 
         self.send_to_api_var = tk.BooleanVar()
-        self.send_to_api_check = ttk.Checkbutton(self.script_frame, text="Enable API Calls", variable=self.send_to_api_var)
+        self.send_to_api_check = ttk.Checkbutton(self.script_frame, text="Enable API Calls",
+                                                 variable=self.send_to_api_var)
         self.send_to_api_check.pack()
 
         self.special_label = ttk.Label(self.script_frame, text="Special Script Requests:")
@@ -360,14 +435,18 @@ class VideoApp:
         veo3_radio.pack()
 
         self.clip_count_var = tk.IntVar(value=1)
-        self.clip_option_1 = ttk.Radiobutton(self.video_frame, text="1 Clip (8 sec)", variable=self.clip_count_var, value=1)
-        self.clip_option_2 = ttk.Radiobutton(self.video_frame, text="2 Clips (16 sec)", variable=self.clip_count_var, value=2)
-        self.clip_option_3 = ttk.Radiobutton(self.video_frame, text="3 Clips (24 sec)", variable=self.clip_count_var, value=3)
+        self.clip_option_1 = ttk.Radiobutton(self.video_frame, text="1 Clip (8 sec)", variable=self.clip_count_var,
+                                             value=1)
+        self.clip_option_2 = ttk.Radiobutton(self.video_frame, text="2 Clips (16 sec)", variable=self.clip_count_var,
+                                             value=2)
+        self.clip_option_3 = ttk.Radiobutton(self.video_frame, text="3 Clips (24 sec)", variable=self.clip_count_var,
+                                             value=3)
         self.clip_option_1.pack()
         self.clip_option_2.pack()
         self.clip_option_3.pack()
 
-        self.send_video_button = ttk.Button(self.video_frame, text="Send to Gemini", command=self.confirm_send_to_gemini)
+        self.send_video_button = ttk.Button(self.video_frame, text="Send to Gemini",
+                                            command=self.confirm_send_to_gemini)
         self.send_video_button.pack(pady=10)
         self.send_video_button["state"] = "disabled"
 
@@ -383,6 +462,7 @@ class VideoApp:
 
         def on_frame_configure(event):
             self.clips_canvas.configure(scrollregion=self.clips_canvas.bbox("all"))
+
         self.clips_frame.bind("<Configure>", on_frame_configure)
 
         self.video_display_frame = ttk.Frame(self.video_frame)
@@ -398,8 +478,14 @@ class VideoApp:
         except Exception as e:
             print(f"[ERROR] Failed to list Gemini models: {e}")
 
+    # ... rest of methods remain unchanged ...
+
+
+
     def log_debug(self, message):
-        self.debug_output.insert("end", message + "\n")
+        # Prepend timestamp in [YYYY-MM-DD HH:MM:SS] format
+        timestamp = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+        self.debug_output.insert("end", f"{timestamp} {message}\n")
         self.debug_output.see("end")
 
     def update_cost(self, *_):
@@ -499,6 +585,7 @@ class VideoApp:
 
     def generate_video(self, scenes, output_dir=None):
         import re
+        import os
         # Ensure each scene has a 'scene' key for indexing
         for idx, scene in enumerate(scenes):
             if 'scene' not in scene or not isinstance(scene['scene'], (str, int)):
@@ -514,6 +601,12 @@ class VideoApp:
         for bar in self.progress_bars.values():
             bar.destroy()
         self.progress_bars = {}
+
+        # Add loading spinner (indeterminate progressbar) to status_output
+        spinner = ttk.Progressbar(self.status_output.master, mode='indeterminate', length=120)
+        spinner.pack(pady=5)
+        spinner.start()
+        self.root.update()
 
         # Track threads so we can know when all clips are done
         threads = []
@@ -542,6 +635,81 @@ class VideoApp:
             play_btn = ttk.Button(container, text="Play Scene", command=lambda p=video_path: subprocess.Popen(["open", p]))
             play_btn.pack(pady=5)
 
+        # Chaining logic for Veo2 if chain_clips_var is set
+        veo_version = self.veo_version_var.get()
+        chain_clips = self.chain_clips_var.get()
+        if veo_version == "veo2" and chain_clips and len(scenes) > 1:
+            # Sequentially generate clips, passing last frame of previous as context for next
+            import cv2
+            prev_clip_path = None
+            prev_frame_image = None
+            for idx, scene in enumerate(scenes):
+                progress = ttk.Progressbar(self.video_display_frame, length=150, mode='determinate')
+                progress.pack(padx=5, pady=5)
+                # Extract scene number robustly
+                scene_str = str(scene['scene'])
+                scene_num_match = re.search(r'\d+', scene_str)
+                scene_num = int(scene_num_match.group()) if scene_num_match else idx + 1
+                self.progress_bars[scene_num] = progress
+                self.root.update()
+                # Find the scene_frame for this scene
+                scene_frame = scene_frame_map.get(scene_num, None)
+                # If not the first scene, capture last frame from previous clip
+                if idx > 0 and prev_clip_path and os.path.exists(prev_clip_path):
+                    try:
+                        cap = cv2.VideoCapture(prev_clip_path)
+                        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count - 1)
+                        ret, frame = cap.read()
+                        cap.release()
+                        if ret:
+                            # Derive PNG path from the previous clip by swapping .mp4 to .png
+                            video_base, _ = os.path.splitext(prev_clip_path)
+                            last_frame_path = f"{video_base}.png"
+                            # Save frame image next to video file
+                            if cv2.imwrite(last_frame_path, frame):
+                                scene['prev_frame_image'] = last_frame_path
+                                self.log_debug(f"Saved last frame image for previous clip at: {last_frame_path}")
+                            else:
+                                self.log_debug(f"Failed to write last frame image to: {last_frame_path}")
+                        else:
+                            self.log_debug(f"Failed to capture last frame from {prev_clip_path}")
+                    except Exception as e:
+                        self.log_debug(f"Error capturing last frame from {prev_clip_path}: {e}")
+                # Generate the clip
+                def run_download(scene=scene, progress=progress, scene_frame=scene_frame, idx=idx):
+                    video_path = generate_veo_clip(
+                        scene,
+                        output_dir,
+                        self.send_to_api_var.get(),
+                        progress,
+                        veo_version
+                    )
+                    scene_str_local = str(scene['scene'])
+                    scene_num_match_local = re.search(r'\d+', scene_str_local)
+                    scene_num_local = int(scene_num_match_local.group()) if scene_num_match_local else idx + 1
+                    if video_path and os.path.exists(video_path):
+                        self.log_debug(f"Scene {scene['scene']} video saved at: {video_path}")
+                        if scene_frame is not None:
+                            update_play_button(video_path, container=scene_frame)
+                        self.status_output.config(text=f"Scene {scene['scene']} downloaded.")
+                        self.error_output.config(text="")  # Clear previous error text if any
+                    else:
+                        self.log_debug(f"Scene {scene['scene']} video generation failed. Check model availability and API permissions.")
+                        self.status_output.config(text=f"Failed to generate scene {scene['scene']}.")
+                        self.error_output.config(text=f"Error with scene {scene['scene']}. See debug log.")
+                    on_clip_finished()
+                run_download()
+                # Set prev_clip_path for next iteration
+                prev_clip_path = os.path.join(output_dir, f"scene_{scene['scene']}.mp4")
+            # Remove/stop spinner after all clips
+            spinner.stop()
+            spinner.destroy()
+            # All clips are done, stitch videos
+            # self.stitch_videos(output_dir, scenes)
+            return
+
+        # Default: generate all clips as before (possibly in parallel)
         for idx, scene in enumerate(scenes):
             progress = ttk.Progressbar(self.video_display_frame, length=150, mode='determinate')
             progress.pack(padx=5, pady=5)
@@ -555,7 +723,7 @@ class VideoApp:
             # Find the scene_frame for this scene
             scene_frame = scene_frame_map.get(scene_num, None)
 
-            def run_download(scene=scene, progress=progress, scene_frame=scene_frame):
+            def run_download(scene=scene, progress=progress, scene_frame=scene_frame, idx=idx):
                 video_path = generate_veo_clip(
                     scene,
                     output_dir,
@@ -584,6 +752,10 @@ class VideoApp:
 
         for t in threads:
             t.join()
+
+        # Remove/stop spinner after threads finish
+        spinner.stop()
+        spinner.destroy()
 
         # All clips are done, stitch videos
         # self.stitch_videos(output_dir, scenes)
@@ -616,9 +788,18 @@ class VideoApp:
                 command=lambda: subprocess.Popen(["open", final_output_path])
             )
             self.open_final_btn.pack(pady=10)
+            # Add Auto-Preview button
+            self.auto_preview_btn = ttk.Button(
+                self.video_display_frame,
+                text="Auto-Preview",
+                command=lambda: subprocess.Popen(["open", final_output_path])
+            )
+            self.auto_preview_btn.pack(pady=(0, 10))
             # Disable the "Send All Clips" button once final video is available
             if hasattr(self, "send_all_btn"):
                 self.send_all_btn["state"] = "disabled"
+            # Export metadata summary after stitching
+            self.export_metadata(scenes, output_dir)
         except FileNotFoundError:
             err_msg = "ffmpeg not found. Please install ffmpeg to enable video stitching."
             print(f"[ERROR] {err_msg}")
@@ -630,9 +811,50 @@ class VideoApp:
                 self.send_all_btn["state"] = "disabled"
             if hasattr(self, "open_final_btn"):
                 self.open_final_btn["state"] = "disabled"
+            if hasattr(self, "auto_preview_btn"):
+                self.auto_preview_btn["state"] = "disabled"
         except subprocess.CalledProcessError as e:
             self.log_debug(f"Failed to stitch videos: {e}")
             messagebox.showerror("Stitching Error", f"Video stitching failed: {e}")
+
+    def export_metadata(self, scenes, output_dir):
+        """
+        Write a summary of all scenes into metadata_summary.json in the output directory.
+        """
+        summary = []
+        for scene in scenes:
+            summary.append({
+                "scene": scene.get("scene"),
+                "narration": scene.get("narration"),
+                "visual_prompt": scene.get("visual_prompt"),
+                "narrator": scene.get("narrator"),
+            })
+        metadata_path = os.path.join(output_dir, "metadata_summary.json")
+        try:
+            with open(metadata_path, "w") as f:
+                json.dump(summary, f, indent=2)
+            self.log_debug(f"Exported scene metadata to {metadata_path}")
+        except Exception as e:
+            self.log_debug(f"Failed to export metadata: {e}")
+
+    def refresh_gemini_quota(self):
+        """
+        Fetch and update Gemini quota status every minute.
+        """
+        import threading
+        import time
+        def fetch_quota():
+            # Dummy implementation: You should replace this with actual Gemini quota API if available.
+            # For demo, we show daily and minute limits and usage from load_usage().
+            usage = load_usage()
+            daily = usage.get("daily_count", 0)
+            minute = len(recent_calls)
+            quota_text = f"Gemini Quota: {minute}/{MINUTE_CLIP_LIMIT} clips/min, {daily}/{DAILY_CLIP_LIMIT} clips/day"
+            self.gemini_quota_label.config(text=quota_text)
+        # Fetch in main thread (it's fast)
+        fetch_quota()
+        # Schedule next update in 60 seconds
+        self.root.after(60000, self.refresh_gemini_quota)
 
     def confirm_send_to_gemini(self):
         clip_count = self.clip_count_var.get()
