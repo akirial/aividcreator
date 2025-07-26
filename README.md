@@ -1,4 +1,4 @@
-# 🎬 aividcreator
+# 🎬 FullyAutoYoutubeVideoCreator
 
 **aividcreator** is an AI-powered video generation tool that takes creative prompts and generates narrated videos scene-by-scene using Google's Gemini API and Veo video models.
 
